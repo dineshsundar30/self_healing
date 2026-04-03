@@ -2,111 +2,92 @@ import traceback
 from robot.libraries.BuiltIn import BuiltIn
 from HealerLogic import find_healed_locator
 
+# Keywords we want to wrap with self-healing logic.
+# By wrapping explicit action keywords rather than low-level find_element,
+# we avoid destroying performance on negative assertions (e.g. Wait Until Element Is Not Visible)
+TARGET_METHODS = [
+    'click_element',
+    'input_text',
+    'input_password',
+    'clear_text',
+    'get_element_by_xpath',
+    'get_webelement',
+    'tap'
+]
+
 class SelfHealingListener:
     """
-    A Robot Framework Listener that globally patches Appium WebDriver 
-    and AppiumLibrary to enable runtime self-healing of locators.
+    A Robot Framework Listener that patches specific high-level Appium action 
+    keywords to enable runtime self-healing of locators without disturbing setup loops.
     """
     
     ROBOT_LISTENER_API_VERSION = 3
 
     def __init__(self):
-        self.webdriver_patched = False
-        self.appiumlib_patched = False
+        self.patched_libraries = set()
 
     def start_keyword(self, data, result):
-        self._patch_webdriver()
-        self._patch_appium_library()
-
-    def _patch_webdriver(self):
-        if self.webdriver_patched:
-            return
-            
-        try:
-            from appium.webdriver.webdriver import WebDriver
-            
-            if not getattr(WebDriver.find_element, '_is_healed', False):
-                original_find_element = WebDriver.find_element
-                
-                def healed_find_element(driver_self, by='id', value=None):
-                    try:
-                        return original_find_element(driver_self, by, value)
-                    except Exception as e:
-                        try:
-                            builtin = BuiltIn()
-                            builtin.log(f"<b style='color:orange'>WARN: Locator '{value}' failed. Triggering Self-Healing!</b>", html=True)
-                        except Exception:
-                            builtin = None
-                            
-                        try:
-                            # 1. Grab XML context directly from the active device
-                            page_source = driver_self.page_source
-                            
-                            # 2. Heal the locator
-                            new_locator = find_healed_locator(value, page_source)
-                            
-                            if new_locator:
-                                if builtin:
-                                    builtin.log(f"<b style='color:green'>SUCCESS: Healed locator discovered: '{new_locator}'. Retrying!</b>", html=True)
-                                
-                                # Healer logic returns pure XPATH string for this POC
-                                from selenium.webdriver.common.by import By
-                                new_by = By.XPATH
-                                new_value = new_locator
-                                if new_locator.startswith('xpath='):
-                                    new_value = new_locator.replace('xpath=', '', 1)
-                                
-                                return original_find_element(driver_self, by=new_by, value=new_value)
-                            else:
-                                raise e # Bubble up original error
-                                
-                        except Exception:
-                            raise e
-                
-                healed_find_element._is_healed = True
-                WebDriver.find_element = healed_find_element
-                self.webdriver_patched = True
-                
-                try:
-                    BuiltIn().log("Self-Healing Engine activated globally via Webdriver Patch.", "INFO")
-                except:
-                    pass
-        except Exception:
-            pass
-
-    def _patch_appium_library(self):
-        if self.appiumlib_patched:
-            return
-            
+        # Patch libraries dynamically exactly once per library
         try:
             builtin = BuiltIn()
             libraries = builtin.get_library_instances()
+            
             for name, lib in libraries.items():
-                if hasattr(lib, '_element_finder') and hasattr(lib._element_finder, 'find'):
-                    if not getattr(lib._element_finder.find, '_is_healed', False):
-                        original_find = lib._element_finder.find
-                        
-                        def create_healed_find(orig_find, capture_source_func):
-                            def healed_find(locator, tag=None, required=True):
-                                try:
-                                    return orig_find(locator, tag, required)
-                                except Exception as e:
-                                    builtin.log(f"<b style='color:orange'>WARN: AppiumLibrary Locator '{locator}' failed. Triggering Self-Healing internally...</b>", html=True)
-                                    try:
-                                        page_source = capture_source_func()
-                                        new_locator = find_healed_locator(locator, page_source)
-                                        if new_locator:
-                                            builtin.log(f"<b style='color:green'>SUCCESS: Healed locator discovered: '{new_locator}'. Retrying Appium action!</b>", html=True)
-                                            return orig_find(new_locator, tag, required)
-                                        else:
-                                            raise e
-                                    except Exception:
-                                        raise e
-                            healed_find._is_healed = True
-                            return healed_find
-                        
-                        lib._element_finder.find = create_healed_find(original_find, lib.get_source)
-                        self.appiumlib_patched = True
-                        builtin.log(f"Self-Healing Engine activated on library: {name}.", "INFO")
+                if name not in self.patched_libraries:
+                    self._patch_library_methods(name, lib, builtin)
+                    self.patched_libraries.add(name)
         except Exception:
             pass
+
+    def _patch_library_methods(self, name, lib, builtin):
+        # We only patch libraries that seem to interact with Appium/UI
+        if not hasattr(lib, '_current_browser') and not hasattr(lib, 'driver') and 'Appium' not in name:
+            return
+
+        for method_name in TARGET_METHODS:
+            if hasattr(lib, method_name):
+                original_method = getattr(lib, method_name)
+                
+                # Check if it's a callable and not already patched
+                if callable(original_method) and not getattr(original_method, '_is_healed', False):
+                    
+                    def create_healed_method(orig_method, lib_instance, m_name):
+                        def healed_wrapper(locator, *args, **kwargs):
+                            try:
+                                return orig_method(locator, *args, **kwargs)
+                            except Exception as e:
+                                # Intercept and heal ONLY if it's a targeted action keyword failing
+                                try:
+                                    builtin.log(f"<b style='color:orange'>WARN: Keyword '{m_name}' failed on locator '{locator}'. Triggering Self-Healing!</b>", html=True)
+                                    
+                                    # Fetch page source
+                                    page_source = None
+                                    if hasattr(lib_instance, 'get_source'):
+                                        page_source = lib_instance.get_source()
+                                    elif hasattr(lib_instance, 'driver'):
+                                        page_source = lib_instance.driver.page_source
+                                    elif hasattr(lib_instance, '_current_browser'):
+                                        page_source = lib_instance._current_browser().page_source
+                                        
+                                    if page_source:
+                                        new_locator = find_healed_locator(locator, page_source)
+                                        if new_locator:
+                                            builtin.log(f"<b style='color:green'>SUCCESS: Healed locator discovered: '{new_locator}'. Retrying!</b>", html=True)
+                                            
+                                            # Optional strict format handling depending on the method
+                                            if m_name == 'get_element_by_xpath' and new_locator.startswith('xpath='):
+                                                new_locator = new_locator.replace('xpath=', '', 1)
+                                                
+                                            return orig_method(new_locator, *args, **kwargs)
+                                    raise e
+                                except Exception:
+                                    raise e
+                        
+                        healed_wrapper._is_healed = True
+                        return healed_wrapper
+                    
+                    setattr(lib, method_name, create_healed_method(original_method, lib, method_name))
+                    try:
+                        builtin.log(f"Self-Healing Engine activated on keyword wrapper: {name}.{method_name}", "INFO")
+                    except:
+                        pass

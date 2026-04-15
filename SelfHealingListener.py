@@ -34,7 +34,7 @@ import traceback
 from collections import defaultdict
 
 from robot.libraries.BuiltIn import BuiltIn
-from HealerLogic import find_healed_locator
+from HealerLogic import find_healed_locators
 
 # Printed exactly once across the entire run regardless of how many suite files
 _ENGINE_BANNER_PRINTED = False
@@ -84,18 +84,20 @@ class SelfHealingListener:
     #     → DO NOT SUPPRESS here
     #
     _IGNORE_ERROR_KEYWORDS = frozenset({
-        "run keyword and ignore error",    # silently discards error — suppress
-        "run keyword and expect error",    # explicitly expects error  — suppress
+        # Add keywords here manually if you wish to suppress healing for them
+        # "run keyword and ignore error",
+        # "run keyword and expect error",
     })
 
     # Pure RF keywords that always assert element ABSENCE (no arg needed)
     _NEGATIVE_KEYWORDS = frozenset({
-        "element should not be visible",
-        "element should not exist",
-        "page should not contain element",
-        "page should not contain",
-        "wait until element is not visible",
-        "wait until page does not contain element",
+        # Add keywords here manually if you wish to suppress healing for them
+        # "element should not be visible",
+        # "element should not exist",
+        # "page should not contain element",
+        # "page should not contain",
+        # "wait until element is not visible",
+        # "wait until page does not contain element",
     })
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -327,7 +329,7 @@ class SelfHealingListener:
 
             # STEP 8 — run healer logic
             try:
-                new_locator = find_healed_locator(value_str, page_source)
+                candidate_locators = find_healed_locators(value_str, page_source)
             except Exception:
                 listener_ref._log(
                     f"[SELF-HEAL] HealerLogic exception for {var_name}:<br>"
@@ -337,7 +339,7 @@ class SelfHealingListener:
                 raise captured_error
 
             # STEP 9 — no match found
-            if not new_locator:
+            if not candidate_locators:
                 listener_ref._log(
                     f"<div style='border:2px solid #cc0000;border-radius:4px;"
                     f"padding:6px 10px;margin:4px 0;background:#fff0f0'>"
@@ -352,51 +354,61 @@ class SelfHealingListener:
                 unhealable_cache[value_str] = now + listener_ref.UNHEALABLE_TTL
                 raise captured_error
 
-            # STEP 10 — try healed locator
-            healed_xpath = (
-                new_locator[len("xpath="):]
-                if new_locator.startswith("xpath=")
-                else new_locator
-            )
-
+            # STEP 10 — try healed locators one by one
             listener_ref._log(
                 f"<div style='border:2px solid #0077cc;border-radius:4px;"
                 f"padding:6px 10px;margin:4px 0;background:#f0f8ff'>"
-                f"<b style='color:#0077cc'>&#128270; HEAL CANDIDATE — retrying</b><br>"
+                f"<b style='color:#0077cc'>&#128270; HEAL CANDIDATES — retrying {len(candidate_locators)} options</b><br>"
                 f"<b>Variable :</b> <code style='color:#9b59b6'>{var_name}</code><br>"
                 f"<b>Original :</b> <code style='color:#cc0000'>{value_str}</code><br>"
-                f"<b>Healed   :</b> <code style='color:#007700'>{healed_xpath}</code>"
                 f"</div>",
                 "INFO", html=True)
 
-            try:
-                found = original_find_element(driver_self, by=By.XPATH, value=healed_xpath)
-                listener_ref._log(
-                    f"<div style='border:2px solid #007700;border-radius:4px;"
-                    f"padding:6px 10px;margin:4px 0;background:#f0fff0'>"
-                    f"<b style='color:#007700'>&#10003; SELF-HEAL SUCCESS</b><br>"
-                    f"<b>Variable :</b> <code style='color:#9b59b6'>{var_name}</code><br>"
-                    f"<b>Original :</b> <code style='color:#cc0000'>{value_str}</code><br>"
-                    f"<b>Healed   :</b> <code style='color:#007700'>{healed_xpath}</code><br>"
-                    f"<b>After {fail_count} failure(s)</b>"
-                    f"</div>",
-                    "INFO", html=True)
-                failure_counts[value_str] = 0
-                return found
+            last_exc = None
+            for loc in candidate_locators:
+                # Determine strategy
+                parsed_by = By.XPATH
+                parsed_val = loc
+                if loc.startswith("id="):
+                    parsed_by = By.ID
+                    parsed_val = loc[3:]
+                elif loc.startswith("accessibility_id="):
+                    parsed_by = "accessibility id"  # Appium specific
+                    parsed_val = loc[17:]
+                elif loc.startswith("xpath="):
+                    parsed_by = By.XPATH
+                    parsed_val = loc[6:]
+                    
+                try:
+                    found = original_find_element(driver_self, by=parsed_by, value=parsed_val)
+                    listener_ref._log(
+                        f"<div style='border:2px solid #007700;border-radius:4px;"
+                        f"padding:6px 10px;margin:4px 0;background:#f0fff0'>"
+                        f"<b style='color:#007700'>&#10003; SELF-HEAL SUCCESS</b><br>"
+                        f"<b>Variable :</b> <code style='color:#9b59b6'>{var_name}</code><br>"
+                        f"<b>Original :</b> <code style='color:#cc0000'>{value_str}</code><br>"
+                        f"<b>Healed   :</b> <code style='color:#007700'>{loc}</code><br>"
+                        f"<b>After {fail_count} failure(s)</b>"
+                        f"</div>",
+                        "INFO", html=True)
+                    failure_counts[value_str] = 0
+                    return found
+                except Exception as retry_exc:
+                    last_exc = retry_exc
+                    continue
 
-            except Exception as retry_exc:
-                listener_ref._log(
-                    f"<div style='border:2px solid #cc0000;border-radius:4px;"
-                    f"padding:6px 10px;margin:4px 0;background:#fff0f0'>"
-                    f"<b style='color:#cc0000'>&#10007; HEALED LOCATOR ALSO FAILED</b><br>"
-                    f"<b>Variable :</b> <code style='color:#9b59b6'>{var_name}</code><br>"
-                    f"<b>Tried    :</b> <code>{healed_xpath}</code><br>"
-                    f"<b>Error    :</b> {type(retry_exc).__name__}: "
-                    f"{str(retry_exc)[:200]}"
-                    f"</div>",
-                    "WARN", html=True)
-                unhealable_cache[value_str] = now + listener_ref.UNHEALABLE_TTL
-                raise captured_error
+            # If all failed
+            listener_ref._log(
+                f"<div style='border:2px solid #cc0000;border-radius:4px;"
+                f"padding:6px 10px;margin:4px 0;background:#fff0f0'>"
+                f"<b style='color:#cc0000'>&#10007; ALL HEALED LOCATORS FAILED</b><br>"
+                f"<b>Variable :</b> <code style='color:#9b59b6'>{var_name}</code><br>"
+                f"<b>Error    :</b> {type(last_exc).__name__}: "
+                f"{str(last_exc)[:200]}"
+                f"</div>",
+                "WARN", html=True)
+            unhealable_cache[value_str] = now + listener_ref.UNHEALABLE_TTL
+            raise captured_error
 
         # ── Install patch ─────────────────────────────────────────────────────
         healed_find_element._is_healed = True

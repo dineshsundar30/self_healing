@@ -18,6 +18,7 @@ import xml.etree.ElementTree as ET
 import json
 import os
 import re
+import difflib
 from typing import Optional, List, Tuple
 
 HEALED_LOCATORS_FILE = "healed_locators.json"
@@ -39,35 +40,38 @@ _GENERIC_WORDS = {
 _MIN_KW_LEN = 3   # lowered to 3 to catch 'eco', 'nav', 'bar'
 
 
-def find_healed_locator(old_locator: str, page_source_xml: str) -> Optional[str]:
+def find_healed_locators(old_locator: str, page_source_xml: str) -> List[str]:
     if not old_locator or not isinstance(old_locator, str):
-        return None
+        return []
     if not page_source_xml or not isinstance(page_source_xml, str):
-        return None
+        return []
 
     # ── 1. Cache lookup ───────────────────────────────────────────────────────
     cached = _lookup_cache(old_locator)
-    if cached:
+    if cached and isinstance(cached, list):
         return cached
+    elif cached and isinstance(cached, str):
+        return [cached]
 
     # ── 2. Extract search value ───────────────────────────────────────────────
     search_value = _extract_search_value(old_locator)
     if not search_value:
-        return None
+        return []
 
     # ── 3. Build keyword list (camelCase-aware) ───────────────────────────────
     keywords = _build_keywords(search_value)
     if not keywords:
-        return None
+        return []
 
     # ── 4. Parse XML ──────────────────────────────────────────────────────────
     try:
         root = ET.fromstring(page_source_xml.encode('utf-8'))
     except (ET.ParseError, TypeError, UnicodeEncodeError, ValueError):
-        return None
+        return []
 
     # ── 5. Score every node ───────────────────────────────────────────────────
-    candidates: List[Tuple[int, int, str]] = []   # (score, priority, xpath)
+    # Score logic: keyword match count + fuzzy string similarity
+    candidates: List[Tuple[float, int, List[str], str]] = []   # (score, priority, locators, debug_info)
 
     for node in root.iter():
         attribs   = node.attrib
@@ -79,45 +83,65 @@ def find_healed_locator(old_locator: str, page_source_xml: str) -> Optional[str]
         norm_text = raw_text.lower()
         norm_desc = raw_desc.lower()
 
-        # Isolate local part of resource-id (after ':id/')
         local_id = norm_id.split(':id/')[-1] if ':id/' in norm_id else norm_id
-
-        score = sum(
+        
+        # Word-based score
+        kw_score = sum(
             1 for kw in keywords
             if kw in local_id or kw in norm_text or kw in norm_desc
         )
-        if score == 0:
+        
+        if kw_score == 0:
             continue
+            
+        # Fuzzy matching score
+        fuzzy_id = difflib.SequenceMatcher(None, search_value.lower(), local_id).ratio()
+        fuzzy_text = difflib.SequenceMatcher(None, search_value.lower(), norm_text).ratio()
+        fuzzy_desc = difflib.SequenceMatcher(None, search_value.lower(), norm_desc).ratio()
+        
+        max_fuzzy = max(fuzzy_id, fuzzy_text, fuzzy_desc)
+        score = kw_score + max_fuzzy
 
-        # Build candidate XPath
+        node_locators = []
+        priority = 3
         if raw_id:
-            xpath, priority = f"//*[@resource-id='{raw_id}']", 0
-        elif raw_desc:
-            xpath, priority = f"//*[@content-desc='{raw_desc}']", 1
-        elif raw_text:
-            xpath, priority = f"//*[@text='{raw_text}']", 2
-        else:
+            node_locators.extend([f"id={raw_id}", f"xpath=//*[@resource-id='{raw_id}']"])
+            priority = min(priority, 0)
+        if raw_desc:
+            node_locators.extend([f"accessibility_id={raw_desc}", f"xpath=//*[@content-desc='{raw_desc}']"])
+            priority = min(priority, 1)
+        if raw_text:
+            node_locators.append(f"xpath=//*[@text='{raw_text}']")
+            priority = min(priority, 2)
+
+        if not node_locators:
+            continue
+            
+        # Avoid suggesting the exact broken locator again
+        if all(loc == old_locator for loc in node_locators):
             continue
 
-        if xpath == old_locator:
-            continue
-
-        # Skip candidates whose local-id part contains the old broken local-id
-        # (would return an equally broken locator)
-        old_local = search_value.split(':id/')[-1] if ':id/' in search_value else ''
-        if old_local and old_local.lower() in xpath.lower():
-            continue
-
-        candidates.append((score, priority, xpath))
+        candidates.append((score, priority, node_locators, str(node_locators[0])))
 
     if not candidates:
-        return None
+        return []
 
     candidates.sort(key=lambda x: (-x[0], x[1]))
-    best_xpath = candidates[0][2]
+    
+    # Take locators from top candidate, or combine top 2-3 candidates locators
+    best_locators: List[str] = []
+    seen = set()
+    top_cands = candidates[:3] if len(candidates) >= 3 else candidates
+    for cand in top_cands: # top 3 best nodes
+        for loc in cand[2]:
+            if loc not in seen and loc != old_locator:
+                seen.add(loc)
+                best_locators.append(loc)
 
-    _save_cache(old_locator, best_xpath)
-    return best_xpath
+    if best_locators:
+        _save_cache(old_locator, best_locators)
+        
+    return best_locators
 
 
 # ── Private helpers ───────────────────────────────────────────────────────────
@@ -187,7 +211,7 @@ def _build_keywords(search_value: str) -> List[str]:
     return list(dict.fromkeys(keywords))   # deduplicate, preserve order
 
 
-def _lookup_cache(old_locator: str) -> Optional[str]:
+def _lookup_cache(old_locator: str) -> Optional[List[str]]:
     if not os.path.exists(HEALED_LOCATORS_FILE):
         return None
     try:
@@ -198,8 +222,8 @@ def _lookup_cache(old_locator: str) -> Optional[str]:
         return None
 
 
-def _save_cache(old: str, new: str) -> None:
-    cache: dict = {}
+def _save_cache(old: str, new: List[str]) -> None:
+    cache: dict[str, List[str]] = {}
     if os.path.exists(HEALED_LOCATORS_FILE):
         try:
             with open(HEALED_LOCATORS_FILE, 'r') as fh:
